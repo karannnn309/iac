@@ -1,0 +1,100 @@
+provider "aws" {
+  region = "us-east-1"
+}
+
+# Data source to fetch the latest Amazon Linux 2 AMI
+data "aws_ami" "amazon_linux_2" {
+  most_recent = true
+  owners      = ["amazon"]
+
+  filter {
+    name   = "name"
+    values = ["amzn2-ami-hvm-*-x86_64-gp2"]
+  }
+
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
+  }
+}
+
+# Data source to get the default VPC
+data "aws_vpc" "default" {
+  default = true
+}
+
+# Data source to get a public subnet in the default VPC for instance deployment
+# Note: For production, distribute instances across multiple AZs for high availability.
+data "aws_subnet" "public" {
+  vpc_id            = data.aws_vpc.default.id
+  map_public_ip_on_launch = true # Ensure it's a public subnet
+  availability_zone = "us-east-1a" # Select a specific AZ for consistency
+}
+
+resource "aws_security_group" "web_sg" {
+  name        = "web_sg"
+  description = "Allow HTTP/HTTPS inbound traffic and restricted outbound"
+  vpc_id      = data.aws_vpc.default.id # Corrected: Associate with VPC
+
+  ingress {
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp" # Corrected: Quoted protocol
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "Allow HTTP from anywhere"
+  }
+
+  ingress {
+    from_port   = 443 # Added HTTPS ingress
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "Allow HTTPS from anywhere"
+  }
+
+  # Corrected: Restricted egress for typical web server operations
+  # Allows outbound HTTP/HTTPS for updates, fetching content, etc.
+  egress {
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "Allow HTTP outbound (e.g., for updates, package managers)"
+  }
+
+  egress {
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "Allow HTTPS outbound (e.g., for updates, APIs)"
+  }
+
+  tags = {
+    Name = "web_sg"
+  }
+}
+
+resource "aws_instance" "web_server" {
+  ami             = data.aws_ami.amazon_linux_2.id # Corrected: Dynamic AMI selection
+  instance_type   = "t2.micro"
+  key_name        = "mykeypair" # Corrected: Quoted key_name
+  # Corrected: Use vpc_security_group_ids and subnet_id for VPC
+  vpc_security_group_ids = [aws_security_group.web_sg.id]
+  subnet_id              = data.aws_subnet.public.id
+  associate_public_ip_address = true # Needed for public instances in public subnet
+
+  count = 2 # Corrected: Integer count
+
+  tags = {
+    Name        = "web-server-${count.index}" # Corrected: Quoted string, unique name for count
+    Environment = "dev"
+  }
+
+  # Corrected: Enable root volume encryption
+  root_block_device {
+    encrypted   = true
+    volume_size = 8 # Default size, can be customized
+    volume_type = "gp2"
+  }
+}
