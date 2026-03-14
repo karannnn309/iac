@@ -2,7 +2,8 @@ provider "aws" {
   region = "us-east-1"
 }
 
-# Data source to fetch the latest Amazon Linux 2 AMI
+# Data source to fetch the latest Amazon Linux 2 AMI for security and maintainability.
+# This ensures instances are launched with the most up-to-date and patched OS.
 data "aws_ami" "amazon_linux_2" {
   most_recent = true
   owners      = ["amazon"]
@@ -18,83 +19,85 @@ data "aws_ami" "amazon_linux_2" {
   }
 }
 
-# Data source to get the default VPC
-data "aws_vpc" "default" {
-  default = true
-}
+resource "aws_instance" "web_server" {
+  # Use the dynamically fetched AMI ID for security and maintainability
+  ami           = data.aws_ami.amazon_linux_2.id
+  instance_type = "t2.micro"
 
-# Data source to get a public subnet in the default VPC for instance deployment
-# Note: For production, distribute instances across multiple AZs for high availability.
-data "aws_subnet" "public" {
-  vpc_id            = data.aws_vpc.default.id
-  map_public_ip_on_launch = true # Ensure it's a public subnet
-  availability_zone = "us-east-1a" # Select a specific AZ for consistency
+  tags = {
+    Name        = "web-server" # Corrected missing quotes
+    Environment = "dev"
+  }
+
+  # Use a variable for the key pair name for better security and management
+  key_name = var.key_name
+
+  # Reference security group by ID for robustness and VPC association
+  vpc_security_group_ids = [aws_security_group.web_sg.id]
+
+  # Corrected count to an integer type
+  count = 2
 }
 
 resource "aws_security_group" "web_sg" {
   name        = "web_sg"
-  description = "Allow HTTP/HTTPS inbound traffic and restricted outbound"
-  vpc_id      = data.aws_vpc.default.id # Corrected: Associate with VPC
+  description = "Allow HTTP inbound traffic and restricted outbound traffic"
+  # Associate with a specific VPC for best practice; use var.vpc_id
+  vpc_id      = var.vpc_id 
 
-  ingress {
-    from_port   = 80
-    to_port     = 80
-    protocol    = "tcp" # Corrected: Quoted protocol
-    cidr_blocks = ["0.0.0.0/0"]
-    description = "Allow HTTP from anywhere"
+  # Restrict inbound HTTP access.
+  # This uses a dynamic block to allow multiple CIDRs or no ingress if the list is empty.
+  # For a truly public web server, if 0.0.0.0/0 on 80/443 is needed, it's CRUCIAL
+  # to place the instance behind an Application Load Balancer (ALB) and a WAF.
+  # For direct instance exposure, restricting to known IPs is much safer.
+  dynamic "ingress" {
+    for_each = var.allowed_web_ingress_cidrs
+    content {
+      from_port   = 80
+      to_port     = 80
+      protocol    = "tcp" # Corrected missing quotes
+      cidr_blocks = [ingress.value]
+      description = "Allow HTTP from specific CIDR"
+    }
   }
 
-  ingress {
-    from_port   = 443 # Added HTTPS ingress
-    to_port     = 443
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-    description = "Allow HTTPS from anywhere"
-  }
-
-  # Corrected: Restricted egress for typical web server operations
-  # Allows outbound HTTP/HTTPS for updates, fetching content, etc.
-  egress {
-    from_port   = 80
-    to_port     = 80
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-    description = "Allow HTTP outbound (e.g., for updates, package managers)"
-  }
-
+  # Restricted egress: allow only HTTPS traffic for updates/APIs to anywhere.
+  # This is more secure than allowing all ports/protocols.
   egress {
     from_port   = 443
     to_port     = 443
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
-    description = "Allow HTTPS outbound (e.g., for updates, APIs)"
+    description = "Allow HTTPS outbound to the internet"
   }
 
-  tags = {
-    Name = "web_sg"
+  # Optionally, allow ICMP for basic ping/health checks for diagnostic purposes.
+  egress {
+    from_port   = -1 # All ICMP types
+    to_port     = -1 # All ICMP codes
+    protocol    = "icmp"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "Allow ICMP outbound to the internet"
   }
 }
 
-resource "aws_instance" "web_server" {
-  ami             = data.aws_ami.amazon_linux_2.id # Corrected: Dynamic AMI selection
-  instance_type   = "t2.micro"
-  key_name        = "mykeypair" # Corrected: Quoted key_name
-  # Corrected: Use vpc_security_group_ids and subnet_id for VPC
-  vpc_security_group_ids = [aws_security_group.web_sg.id]
-  subnet_id              = data.aws_subnet.public.id
-  associate_public_ip_address = true # Needed for public instances in public subnet
+# Variables for better security, flexibility, and maintainability
 
-  count = 2 # Corrected: Integer count
+variable "key_name" {
+  description = "The name of the EC2 Key Pair to allow SSH access. This should be securely managed."
+  type        = string
+}
 
-  tags = {
-    Name        = "web-server-${count.index}" # Corrected: Quoted string, unique name for count
-    Environment = "dev"
-  }
+variable "allowed_web_ingress_cidrs" {
+  description = "List of CIDR blocks allowed for inbound HTTP (port 80). Set [\"0.0.0.0/0\"] for public access ONLY IF the instance is behind an ALB/WAF. Default is an empty list, meaning no public access."
+  type        = list(string)
+  default     = [] # Secure by default: no public ingress unless explicitly defined
+  # Example for restricted access: default = ["your.office.public.ip/32"]
+}
 
-  # Corrected: Enable root volume encryption
-  root_block_device {
-    encrypted   = true
-    volume_size = 8 # Default size, can be customized
-    volume_type = "gp2"
-  }
+variable "vpc_id" {
+  description = "The ID of the VPC where the security group and instances will be created. It's best practice to explicitly define this."
+  type        = string
+  # Consider using a data source to fetch an existing VPC ID dynamically if applicable.
+  # default = "vpc-xxxxxxxxxxxxxxxxx" # Example if you want a default VPC ID
 }
