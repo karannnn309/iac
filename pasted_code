@@ -1,100 +1,231 @@
 provider "aws" {
-  region = "us-east-1"
+  region = "ap-south-1"   # Mumbai region
 }
 
-# Data source to fetch the latest Amazon Linux 2 AMI
-data "aws_ami" "amazon_linux_2" {
-  most_recent = true
-  owners      = ["amazon"]
+# ------------------------
+# Variables for Security Enhancements
+# ------------------------
+variable "trusted_ssh_cidr" {
+  description = "CIDR block for trusted SSH access (e.g., your office IP). This variable is required."
+  type        = string
+  # No default, forcing the user to specify it securely.
+  # Example: "203.0.113.0/32"
+}
 
-  filter {
-    name   = "name"
-    values = ["amzn2-ami-hvm-*-x86_64-gp2"]
+variable "key_name" {
+  description = "The name of the EC2 Key Pair to allow SSH access to the instance. This key pair must exist in AWS. This variable is required."
+  type        = string
+  # No default, forcing the user to specify it securely.
+  # Example: "my-ec2-keypair"
+}
+
+# ------------------------
+# VPC
+# ------------------------
+resource "aws_vpc" "main" {
+  cidr_block = "10.0.0.0/16"
+
+  tags = {
+    Name = "my-secure-vpc"
+  }
+}
+
+# ------------------------
+# Subnets
+# (Separating into public and private for better security posture)
+# ------------------------
+resource "aws_subnet" "public" {
+  vpc_id                  = aws_vpc.main.id
+  cidr_block              = "10.0.1.0/24"
+  availability_zone       = "ap-south-1a"
+  map_public_ip_on_launch = true # Public subnet for NAT Gateway and potentially Load Balancers
+
+  tags = {
+    Name = "my-public-subnet"
+  }
+}
+
+resource "aws_subnet" "private" {
+  vpc_id            = aws_vpc.main.id
+  cidr_block        = "10.0.2.0/24"
+  availability_zone = "ap-south-1a"
+  # map_public_ip_on_launch is false by default for private subnets
+
+  tags = {
+    Name = "my-private-subnet"
+  }
+}
+
+# ------------------------
+# Internet Gateway
+# ------------------------
+resource "aws_internet_gateway" "igw" {
+  vpc_id = aws_vpc.main.id
+
+  tags = {
+    Name = "my-igw"
+  }
+}
+
+# ------------------------
+# NAT Gateway (for outbound internet access from private subnets)
+# ------------------------
+resource "aws_eip" "nat" {
+  vpc        = true
+  depends_on = [aws_internet_gateway.igw] # Ensure IGW exists before EIP for NAT
+
+  tags = {
+    Name = "my-nat-eip"
+  }
+}
+
+resource "aws_nat_gateway" "nat" {
+  allocation_id = aws_eip.nat.id
+  subnet_id     = aws_subnet.public.id # NAT Gateway must be in a public subnet
+
+  tags = {
+    Name = "my-nat-gateway"
+  }
+}
+
+# ------------------------
+# Route Tables
+# ------------------------
+# Public Route Table for public subnet
+resource "aws_route_table" "public_rt" {
+  vpc_id = aws_vpc.main.id
+
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.igw.id
   }
 
-  filter {
-    name   = "virtualization-type"
-    values = ["hvm"]
+  tags = {
+    Name = "my-public-rt"
   }
 }
 
-# Data source to get the default VPC
-data "aws_vpc" "default" {
-  default = true
+resource "aws_route_table_association" "public_rta" {
+  subnet_id      = aws_subnet.public.id
+  route_table_id = aws_route_table.public_rt.id
 }
 
-# Data source to get a public subnet in the default VPC for instance deployment
-# Note: For production, distribute instances across multiple AZs for high availability.
-data "aws_subnet" "public" {
-  vpc_id            = data.aws_vpc.default.id
-  map_public_ip_on_launch = true # Ensure it's a public subnet
-  availability_zone = "us-east-1a" # Select a specific AZ for consistency
+# Private Route Table for private subnet (routes outbound to NAT Gateway)
+resource "aws_route_table" "private_rt" {
+  vpc_id = aws_vpc.main.id
+
+  route {
+    cidr_block     = "0.0.0.0/0"
+    nat_gateway_id = aws_nat_gateway.nat.id
+  }
+
+  tags = {
+    Name = "my-private-rt"
+  }
 }
 
-resource "aws_security_group" "web_sg" {
-  name        = "web_sg"
-  description = "Allow HTTP/HTTPS inbound traffic and restricted outbound"
-  vpc_id      = data.aws_vpc.default.id # Corrected: Associate with VPC
+resource "aws_route_table_association" "private_rta" {
+  subnet_id      = aws_subnet.private.id
+  route_table_id = aws_route_table.private_rt.id
+}
+
+# ------------------------
+# IAM Role and Instance Profile for EC2
+# (Allows secure interaction with AWS services, e.g., Systems Manager)
+# ------------------------
+resource "aws_iam_role" "ec2_role" {
+  name = "my-ec2-ssm-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      {
+        Action = "sts:AssumeRole",
+        Effect = "Allow",
+        Principal = {
+          Service = "ec2.amazonaws.com"
+        },
+      },
+    ],
+  })
+
+  tags = {
+    Name = "my-ec2-ssm-role"
+  }
+}
+
+resource "aws_iam_role_policy_attachment" "ec2_ssm_policy" {
+  role       = aws_iam_role.ec2_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore" # Enables EC2 to be managed by AWS Systems Manager
+}
+
+resource "aws_iam_instance_profile" "ec2_profile" {
+  name = "my-ec2-ssm-profile"
+  role = aws_iam_role.ec2_role.name
+}
+
+# ------------------------
+# Security Group
+# ------------------------
+resource "aws_security_group" "ec2_sg" {
+  name        = "my-ec2-security-group"
+  description = "Security group for private EC2 instance"
+  vpc_id      = aws_vpc.main.id
+
+  # Ingress rules - Restricted
+  ingress {
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = [var.trusted_ssh_cidr] # Restrict SSH to a specific trusted IP range
+    description = "Allow SSH from trusted IP range"
+  }
 
   ingress {
     from_port   = 80
     to_port     = 80
-    protocol    = "tcp" # Corrected: Quoted protocol
-    cidr_blocks = ["0.0.0.0/0"]
-    description = "Allow HTTP from anywhere"
-  }
-
-  ingress {
-    from_port   = 443 # Added HTTPS ingress
-    to_port     = 443
     protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-    description = "Allow HTTPS from anywhere"
+    cidr_blocks = [aws_vpc.main.cidr_block] # Restrict HTTP to internal VPC network
+    description = "Allow HTTP from VPC internal network"
   }
 
-  # Corrected: Restricted egress for typical web server operations
-  # Allows outbound HTTP/HTTPS for updates, fetching content, etc.
-  egress {
-    from_port   = 80
-    to_port     = 80
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-    description = "Allow HTTP outbound (e.g., for updates, package managers)"
-  }
-
+  # Egress rules - Restricted to necessary outbound ports
   egress {
     from_port   = 443
     to_port     = 443
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
-    description = "Allow HTTPS outbound (e.g., for updates, APIs)"
+    description = "Allow outbound HTTPS for updates and external APIs"
+  }
+
+  egress {
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "Allow outbound HTTP for updates and package repositories"
   }
 
   tags = {
-    Name = "web_sg"
+    Name = "my-ec2-sg"
   }
 }
 
-resource "aws_instance" "web_server" {
-  ami             = data.aws_ami.amazon_linux_2.id # Corrected: Dynamic AMI selection
-  instance_type   = "t2.micro"
-  key_name        = "mykeypair" # Corrected: Quoted key_name
-  # Corrected: Use vpc_security_group_ids and subnet_id for VPC
-  vpc_security_group_ids = [aws_security_group.web_sg.id]
-  subnet_id              = data.aws_subnet.public.id
-  associate_public_ip_address = true # Needed for public instances in public subnet
+# ------------------------
+# EC2 Instance
+# ------------------------
+resource "aws_instance" "ec2" {
+  ami           = "ami-0f58b397bc5c1f2e8"  # Amazon Linux (Mumbai)
+  instance_type = "t2.micro"
+  subnet_id     = aws_subnet.private.id # Placed in private subnet for reduced exposure
+  key_name      = var.key_name            # For secure SSH access
+  iam_instance_profile = aws_iam_instance_profile.ec2_profile.name # For secure AWS permissions (e.g., SSM)
 
-  count = 2 # Corrected: Integer count
+  vpc_security_group_ids = [aws_security_group.ec2_sg.id]
+
+  associate_public_ip_address = false # No public IP address directly on the instance
 
   tags = {
-    Name        = "web-server-${count.index}" # Corrected: Quoted string, unique name for count
-    Environment = "dev"
-  }
-
-  # Corrected: Enable root volume encryption
-  root_block_device {
-    encrypted   = true
-    volume_size = 8 # Default size, can be customized
-    volume_type = "gp2"
+    Name = "my-secure-ec2"
   }
 }
